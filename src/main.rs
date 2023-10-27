@@ -85,7 +85,7 @@ impl Set {
     }
 }
 
-fn parse_set_columns(record: &csv::StringRecord) -> (Vec<SetColumns>) {
+fn parse_set_columns(record: &csv::StringRecord) -> Vec<SetColumns> {
     let mut suite_index = None;
     let mut text_index = None;
     let mut special_index = None;
@@ -122,19 +122,19 @@ fn parse_set_columns(record: &csv::StringRecord) -> (Vec<SetColumns>) {
     result
 }
 
+fn parse_field(record: &csv::StringRecord, idx: usize) -> String {
+    record
+        .get(idx)
+        .map_or_else(|| String::from(""), |s| s.to_string())
+}
+
 fn parse_cards(
     record: &csv::StringRecord,
-    sets: &mut HashMap<Uuid, Set>,
-    cols: &mut HashMap<Uuid, SetColumns>,
-) {
-    if record.is_empty() {
-        return;
-    }
+    mapping: HashMap<Uuid, SetColumns>,
+) -> HashMap<Uuid, Vec<Card>> {
+    let mut cards: HashMap<Uuid, Vec<Card>> = HashMap::new();
 
-    for (set_id, col) in cols.iter() {
-        let suite = record.get(col.suite).unwrap_or("");
-        let text = record.get(col.text).unwrap_or("");
-        let special = record.get(col.special).unwrap_or("");
+    for (set_id, col) in mapping.iter() {
         let mut editions: Vec<Uuid> = Vec::new();
         for (id, idx) in col.editions.iter() {
             if record.get(*idx).is_none() {
@@ -142,14 +142,17 @@ fn parse_cards(
             }
             editions.push(*id);
         }
-        if let Some(suite) = Suite::from_str(suite) {
-            let mut card = Card::new(suite, text.to_string(), special.to_string());
+        if let Some(suite) = Suite::from_str(&parse_field(&record, col.suite)) {
+            let mut card = Card::new(
+                suite,
+                parse_field(&record, col.text),
+                parse_field(&record, col.special),
+            );
             card.editions = editions;
-            if let Some(set) = sets.get_mut(&set_id) {
-                set.cards.push(card);
-            }
+            cards.entry(*set_id).or_insert(Vec::new()).push(card)
         }
     }
+    return cards;
 }
 
 fn parse_csv_file(file_path: &str) -> Result<Vec<Set>, Box<dyn Error>> {
@@ -163,31 +166,33 @@ fn parse_csv_file(file_path: &str) -> Result<Vec<Set>, Box<dyn Error>> {
 
     for result in rdr.records() {
         let record = result?;
-        parse_cards(&record, &mut parsing, &mut mapping);
-
-        let new_set_columns = parse_set_columns(&record);
-
-        let mut finished = Vec::new();
-
-        for set_column in &new_set_columns {
-            let matching_set_column = mapping.iter().find(|(_, column)| {
-                column.suite == set_column.suite
-                    && column.text == set_column.text
-                    && column.special == set_column.special
-            });
-
-            match matching_set_column {
-                Some((key, _)) => {
-                    if let Some(set) = parsing.get(key) {
-                        sets.push(set.clone());
-                    }
-                    finished.push(key.clone());
-                }
-                None => {}
+        let cards = parse_cards(&record, mapping.clone());
+        for (set_id, cards) in cards {
+            if let Some(set) = parsing.get_mut(&set_id) {
+                set.cards.extend(cards)
             }
         }
 
+        let new_set_columns = parse_set_columns(&record);
+
+        let finished: Vec<Uuid> = new_set_columns
+            .iter()
+            .filter_map(|set_column| {
+                mapping
+                    .iter()
+                    .find(|(_, column)| {
+                        column.suite == set_column.suite
+                            && column.text == set_column.text
+                            && column.special == set_column.special
+                    })
+                    .map(|(key, _)| key.clone())
+            })
+            .collect();
+
         for id in finished {
+            if let Some(set) = parsing.get(&id) {
+                sets.push(set.clone());
+            }
             let _ = parsing.remove(&id);
             let _ = mapping.remove(&id);
         }
