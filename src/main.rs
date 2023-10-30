@@ -1,5 +1,13 @@
-use std::{collections::HashMap, error::Error, fs::File};
+use actix_multipart::{
+    form::{
+        tempfile::{TempFile, TempFileConfig},
+        MultipartForm,
+    },
+    Multipart,
+};
+use std::{collections::HashMap, error::Error, fs::{File, self}};
 
+use actix_web::{get, web::{self, Redirect}, App, Error as ActixError, HttpResponse, HttpServer, Responder};
 use uuid::Uuid;
 
 extern crate csv;
@@ -209,17 +217,79 @@ fn parse_csv_file(file_path: &str) -> Result<Vec<Set>, Box<dyn Error>> {
     Ok(sets)
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let file_path = "./data/Cards Against Humanity - CAH Main Deck.csv";
+#[get("/")]
+async fn hello() -> impl Responder {
+    HttpResponse::Ok().body("Hello world!")
+}
 
-    let sets = parse_csv_file(file_path)?;
-    print!("found {} sets", sets.len());
-    for set in sets {
-        println!("{}", set.name);
-        for card in &set.cards[0..10] {
-            println!("Card: {}", card.text);
+#[derive(Debug, MultipartForm)]
+struct UploadForm {
+    #[multipart(rename = "file")]
+    files: Vec<TempFile>,
+}
+
+async fn upload_csv(
+    MultipartForm(form): MultipartForm<UploadForm>,
+) -> Result<impl Responder, ActixError> {
+    for f in form.files {
+        let path = format!("./tmp/{}", f.file_name.unwrap());
+        println!("saving to {path}");
+        f.file.persist(&path).unwrap();
+        // Process the uploaded CSV data
+        let sets = parse_csv_file(&path)?;
+        match fs::remove_file(path) {
+            Ok(_) => {
+                println!("File deleted successfully.");
+            }
+            Err(err) => {
+                eprintln!("Failed to delete the file: {:?}", err);
+            }
+        }
+        print!("found {} sets", sets.len());
+        for set in sets {
+            println!("{}", set.name);
+            for card in &set.cards[0..10] {
+                println!("Card: {}", card.text);
+            }
         }
     }
 
-    Ok(())
+    Ok(Redirect::to("localhost:12001").permanent())
+}
+
+async fn index() -> HttpResponse {
+    let html = r#"<html>
+        <head><title>Upload Test</title></head>
+        <body>
+            <form target="/" method="post" enctype="multipart/form-data">
+                <input type="file" multiple name="file"/>
+                <button type="submit">Submit</button>
+            </form>
+        </body>
+    </html>"#;
+
+    HttpResponse::Ok().body(html)
+}
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    std::fs::create_dir_all("./tmp")?;
+
+    HttpServer::new(|| {
+        App::new()
+            .app_data(TempFileConfig::default().directory("./tmp"))
+            .service(
+                web::resource("/")
+                    .route(web::get().to(index))
+                    .route(web::post().to(upload_csv)),
+            )
+    })
+    .bind(("127.0.0.1", 12001))?
+    .workers(2)
+    .run()
+    .await
+
+    // let file_path = "./data/Cards Against Humanity - CAH Main Deck.csv";
+
+    // Ok(())
 }
