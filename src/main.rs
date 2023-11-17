@@ -1,28 +1,38 @@
-use actix_multipart::{
-    form::{
-        tempfile::{TempFile, TempFileConfig},
-        MultipartForm,
-    },
-    Multipart,
+use actix_multipart::form::{
+    tempfile::{TempFile, TempFileConfig},
+    MultipartForm,
 };
-use std::{collections::HashMap, error::Error, fs::{File, self}};
+use serde::Deserialize;
+use serde::Serialize;
+use std::{
+    collections::HashMap,
+    error::Error,
+    fs::{self, File},
+};
 
-use actix_web::{get, web::{self, Redirect}, App, Error as ActixError, HttpResponse, HttpServer, Responder};
+use mongodb::{bson::doc, Client, Collection, Database};
+
+use actix_web::{
+    get,
+    web::{self, Redirect},
+    App, Error as ActixError, HttpResponse, HttpServer, Responder,
+};
 use uuid::Uuid;
 
 extern crate csv;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum Suite {
-    BLACK,
-    WHITE,
+    PROMPT,
+    RESPONSE,
 }
 
 impl Suite {
     fn from_str(value: &str) -> Option<Suite> {
         match value {
-            "Prompt" => Some(Suite::BLACK),
-            "Response" => Some(Suite::WHITE),
+            "Prompt" => Some(Suite::PROMPT),
+            "Response" => Some(Suite::RESPONSE),
             _ => None,
         }
     }
@@ -30,8 +40,8 @@ impl Suite {
 
 #[derive(Debug, Clone)]
 struct Edition {
-    id: Option<Uuid>,
-    temp_id: Uuid,
+    uuid: Uuid,
+    set_uuid: Uuid,
     country_code: String,
     version: String,
 }
@@ -44,10 +54,9 @@ struct SetColumns {
     editions: HashMap<Uuid, usize>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Card {
-    id: Option<Uuid>,
-    temp_id: Uuid,
+    uuid: Uuid,
     suite: Suite,
     text: String,
     special: String,
@@ -55,10 +64,8 @@ struct Card {
 }
 impl Card {
     fn new(suite: Suite, text: String, special: String) -> Self {
-        let temp_id = Uuid::new_v4();
         Card {
-            id: None,
-            temp_id,
+            uuid: Uuid::new_v4(),
             suite,
             text,
             special,
@@ -66,31 +73,54 @@ impl Card {
         }
     }
 }
-#[derive(Debug, Clone)]
-struct CardEdition {
-    card_id: Uuid,
-    edition_id: Uuid,
-}
-#[derive(Debug, Clone)]
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Set {
-    id: Option<u64>,
-    temp_id: Uuid,
-    name: String,
-    cards: Vec<Card>,
-    editions: Vec<Edition>,
+    pub uuid: Uuid,
+    pub name: String,
+    #[serde(skip)]
+    pub cards: Vec<Card>,
+    #[serde(skip)]
+    pub editions: Vec<Edition>,
 }
 
 impl Set {
     fn new(name: String) -> Self {
-        let temp_id = Uuid::new_v4();
         Set {
-            id: None,
-            temp_id,
+            uuid: Uuid::new_v4(),
             name,
             cards: Vec::new(),
             editions: Vec::new(),
         }
     }
+}
+
+fn parse_set_editions(record: &csv::StringRecord) -> HashMap<Uuid, HashMap<usize, String>> {
+    let mut result: HashMap<Uuid, HashMap<usize, String>> = HashMap::new();
+
+    let mut current_set_uuid: Option<Uuid> = None;
+    let mut current_set_index: Option<usize> = None;
+
+    for (index, field) in record.iter().enumerate() {
+        if field == "Edition" {
+            current_set_uuid = Some(Uuid::new_v4());
+            current_set_index = Some(index);
+        } else if !field.is_empty() {
+            if let (Some(set_uuid), Some(index)) = (current_set_uuid, current_set_index) {
+                result
+                    .entry(set_uuid)
+                    .or_insert_with(HashMap::new)
+                    .insert(index, field.to_string());
+            }
+        }
+    }
+    for (uuid, editions) in &result {
+        println!("UUID: {:?}", uuid);
+        for (index, edition) in editions {
+            println!("Index: {}, Edition: {:?}", index, edition);
+        }
+    }
+    return result;
 }
 
 fn parse_set_columns(record: &csv::StringRecord) -> Vec<SetColumns> {
@@ -180,6 +210,7 @@ fn parse_csv_file(file_path: &str) -> Result<Vec<Set>, Box<dyn Error>> {
                 set.cards.extend(cards)
             }
         }
+        let _= parse_set_editions(&record);
 
         let new_set_columns = parse_set_columns(&record);
 
@@ -207,7 +238,7 @@ fn parse_csv_file(file_path: &str) -> Result<Vec<Set>, Box<dyn Error>> {
 
         for set_column in new_set_columns {
             let s = Set::new(record[set_column.text as usize].to_string());
-            let id = s.temp_id;
+            let id = s.uuid;
             parsing.insert(id, s);
             mapping.insert(id, set_column);
         }
@@ -217,15 +248,43 @@ fn parse_csv_file(file_path: &str) -> Result<Vec<Set>, Box<dyn Error>> {
     Ok(sets)
 }
 
-#[get("/")]
-async fn hello() -> impl Responder {
-    HttpResponse::Ok().body("Hello world!")
-}
-
 #[derive(Debug, MultipartForm)]
 struct UploadForm {
     #[multipart(rename = "file")]
     files: Vec<TempFile>,
+}
+
+async fn save_set(set: &Set) -> Result<(), mongodb::error::Error> {
+    let uri = "mongodb://admin:mypassword@localhost:27017";
+    let client = Client::with_uri_str(uri).await?;
+    let database = client.database("controversy");
+    let sets_collection: Collection<Set> = database.collection("sets");
+    match sets_collection.insert_one(set, None).await {
+        Ok(_) => {
+            println!("Successfully added set {:?}", set.name);
+            return Ok(());
+        }
+        Err(err) => {
+            // Handle other errors if necessary
+            eprintln!("Error inserting set: {}", err);
+
+            return Ok(());
+        }
+    }
+}
+async fn save_cards(cards: &Vec<Card>) -> Result<(), mongodb::error::Error> {
+    let uri = "mongodb://admin:mypassword@localhost:27017";
+    let client = Client::with_uri_str(uri).await?;
+    let database = client.database("controversy");
+    let card_collection: Collection<Card> = database.collection("cards");
+    card_collection.insert_many(cards, None).await?;
+    Ok(())
+}
+
+async fn add_set(set: &Set) -> Result<(), mongodb::error::Error> {
+    save_set(set).await?;
+    save_cards(&set.cards).await?;
+    Ok(())
 }
 
 async fn upload_csv(
@@ -242,11 +301,12 @@ async fn upload_csv(
                 println!("File deleted successfully.");
             }
             Err(err) => {
-                eprintln!("Failed to delete the file: {:?}", err);
+                println!("Failed to delete the file: {:?}", err);
             }
         }
-        print!("found {} sets", sets.len());
+        println!("found {} sets", sets.len());
         for set in sets {
+            // let _ = add_set(&set).await;
             println!("{}", set.name);
             for card in &set.cards[0..10] {
                 println!("Card: {}", card.text);
